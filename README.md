@@ -18,6 +18,17 @@ Portuguese, Spanish and French.
 
 ![Editor with a furnished 105 m² apartment: catalog, rendered floor plan and live 3D view](docs/images/editor.png)
 
+## In this fork
+
+- **Arabic interface (العربية):** *Help → Idioma / Language → العربية*. Letters join
+  and sentences read right to left; numbers, shortcuts and file names inside Arabic
+  text keep their order. The panels themselves still lay out left to right.
+- **Plan or sketch to 3D (حوّل المخطط أو الكروكي إلى 3D):** *Plan → Background image →
+  Import…*, calibrate the scale by clicking two points of a known distance, then
+  *Convert plan to 3D* (a printed or exported plan with filled walls) or *Convert
+  sketch to 3D* (a hand drawing with thin pen lines). The walls appear in the 3D view
+  in one undo step. Works best on straight, right-angled walls.
+
 ## Three ways to use it
 
 | | What you get | Account |

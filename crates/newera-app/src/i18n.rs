@@ -4,6 +4,9 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+#[path = "i18n_ar.rs"]
+mod ar;
+
 /// A language the window speaks.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Lang {
@@ -14,11 +17,13 @@ pub(crate) enum Lang {
     En,
     Es,
     Fr,
+    /// Arabic, written right to left: see [`ar`] for how egui is fed it.
+    Ar,
 }
 
 impl Lang {
     /// Every language, in the order the menu lists them.
-    pub(crate) const ALL: [Self; 4] = [Self::Pt, Self::En, Self::Es, Self::Fr];
+    pub(crate) const ALL: [Self; 5] = [Self::Pt, Self::En, Self::Es, Self::Fr, Self::Ar];
 
     /// How the language names itself — the one name whoever looks for it
     /// reads without knowing any of the others.
@@ -28,6 +33,7 @@ impl Lang {
             Self::En => "English",
             Self::Es => "Español",
             Self::Fr => "Français",
+            Self::Ar => "العربية",
         }
     }
 
@@ -38,32 +44,35 @@ impl Lang {
             Self::En => "en",
             Self::Es => "es",
             Self::Fr => "fr",
+            Self::Ar => "ar",
         }
     }
 
     /// Whether numbers are written with a comma for the decimals: everyone
-    /// here but English.
+    /// here but English and Arabic (as written in Saudi Arabia and the Gulf).
     pub(crate) const fn decimal_comma(self) -> bool {
-        !matches!(self, Self::En)
+        !matches!(self, Self::En | Self::Ar)
     }
 
     /// Which side of a table row the language is on; Portuguese is the key
     /// of the row, not a side of it.
     const fn column(self) -> Option<usize> {
         match self {
-            Self::Pt => None,
+            // Portuguese is the key; Arabic has a table of its own (`lookup`).
+            Self::Pt | Self::Ar => None,
             Self::En => Some(0),
             Self::Es => Some(1),
             Self::Fr => Some(2),
         }
     }
 
-    const fn code(self) -> u8 {
+    pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Pt => 0,
             Self::En => 1,
             Self::Es => 2,
             Self::Fr => 3,
+            Self::Ar => 4,
         }
     }
 
@@ -72,6 +81,7 @@ impl Lang {
             1 => Self::En,
             2 => Self::Es,
             3 => Self::Fr,
+            4 => Self::Ar,
             _ => Self::Pt,
         }
     }
@@ -117,7 +127,7 @@ pub(crate) fn lang() -> Lang {
 pub(crate) fn findings_language() -> newera_core::vocabulary::Language {
     match lang() {
         Lang::Pt => newera_core::vocabulary::Language::Portuguese,
-        Lang::En | Lang::Es | Lang::Fr => newera_core::vocabulary::Language::English,
+        Lang::En | Lang::Es | Lang::Fr | Lang::Ar => newera_core::vocabulary::Language::English,
     }
 }
 
@@ -130,10 +140,41 @@ pub(crate) fn decimal_comma() -> bool {
 /// Translates a line that only exists at run time: what a background job says
 /// it is doing comes from the work itself, not from a literal in this crate.
 pub(crate) fn dynamic(pt: &str) -> String {
-    let Some(column) = lang().column() else {
-        return pt.to_owned();
-    };
-    translations(pt).map_or_else(|| pt.to_owned(), |row| row[column].to_owned())
+    let lang = lang();
+    displayed(
+        &lookup(pt, lang).map_or_else(|| pt.to_owned(), str::to_owned),
+        lang,
+    )
+}
+
+/// The translation of `pt` in `lang`, or nothing when it has none (and in
+/// Portuguese, which is the text itself). Arabic falls back on English: an
+/// Arabic reader more likely reads English than Portuguese.
+fn lookup(pt: &str, lang: Lang) -> Option<&'static str> {
+    match lang {
+        Lang::Pt => None,
+        Lang::Ar => ar::arabic(pt).or_else(|| translations(pt).map(|row| row[0])),
+        _ => {
+            let column = lang.column()?;
+            translations(pt).map(|row| row[column])
+        }
+    }
+}
+
+/// Whether the other languages translate `pt`.
+#[cfg(test)]
+fn has_translation(pt: &str) -> bool {
+    translations(pt).is_some()
+}
+
+/// `text` as the window draws it in `lang`: Arabic is prepared for egui's
+/// shaper (see [`ar::visual`]); every other language is drawn as it is.
+fn displayed(text: &str, lang: Lang) -> String {
+    if lang == Lang::Ar {
+        ar::visual(text)
+    } else {
+        text.to_owned()
+    }
 }
 
 /// A name that lives in the project, as the window shows it. The defaults
@@ -142,14 +183,15 @@ pub(crate) fn dynamic(pt: &str) -> String {
 /// screen they follow the window's language. A name somebody typed is theirs
 /// and stays as it is.
 pub(crate) fn shown(name: &str) -> String {
-    shown_in(name, lang())
+    let lang = lang();
+    displayed(&shown_in(name, lang), lang)
 }
 
 /// [`shown`] in one named language. See [`say`].
 fn shown_in(name: &str, lang: Lang) -> String {
-    let Some(column) = lang.column() else {
+    if lang == Lang::Pt {
         return name.to_owned();
-    };
+    }
     if let Some(original) = name.strip_suffix(" (cópia)") {
         return format!("{}{}", shown_in(original, lang), say(" (cópia)", lang));
     }
@@ -159,14 +201,30 @@ fn shown_in(name: &str, lang: Lang) -> String {
     {
         return fill_in("Versão {}", lang, &[&n]);
     }
-    translations(name).map_or_else(|| name.to_owned(), |row| row[column].to_owned())
+    lookup(name, lang).map_or_else(|| name.to_owned(), str::to_owned)
 }
 
 /// The text in the language the window is set to: `pt` is the Portuguese
 /// the code is written in, and comes back as it is when there is no
 /// translation for it.
 pub(crate) fn tr(pt: &'static str) -> &'static str {
-    say(pt, lang())
+    // Prepared once per text and kept: the window asks for the same few
+    // hundred labels every frame.
+    static SHOWN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>,
+    > = std::sync::OnceLock::new();
+    let lang = lang();
+    let text = say(pt, lang);
+    if lang != Lang::Ar {
+        return text;
+    }
+    let mut shown = SHOWN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shown
+        .entry(text)
+        .or_insert_with(|| Box::leak(ar::visual(text).into_boxed_str()))
 }
 
 /// The text in every language the window speaks, Portuguese first: what a
@@ -180,16 +238,14 @@ pub(crate) fn every(pt: &'static str) -> impl Iterator<Item = &'static str> {
 /// itself always wants [`tr`]; this is for the tests, which run beside each
 /// other and must not shout across.
 fn say(pt: &'static str, lang: Lang) -> &'static str {
-    let Some(column) = lang.column() else {
-        return pt;
-    };
-    translations(pt).map_or(pt, |row| row[column])
+    lookup(pt, lang).unwrap_or(pt)
 }
 
 /// A sentence with things in it: `{}` in the text marks where each one goes,
 /// in every language, so a translation is free to put them elsewhere.
 pub(crate) fn fill(pt: &'static str, parts: &[&dyn std::fmt::Display]) -> String {
-    fill_in(pt, lang(), parts)
+    let lang = lang();
+    displayed(&fill_in(pt, lang, parts), lang)
 }
 
 /// [`fill`] in one named language. See [`say`].
@@ -2189,6 +2245,42 @@ fn translations(pt: &str) -> Option<[&'static str; 3]> {
             "Quien tenga esa dirección edita este proyecto: trátela como una contraseña.",
             "Quiconque a cette adresse modifie ce projet : traitez-la comme un mot de passe.",
         ],
+        // Turning a plan image or a hand sketch into walls.
+        "⚠ Importe primeiro a imagem da planta (Imagem de fundo → Importar…)." => [
+            "⚠ Import the plan image first (Background image → Import…).",
+            "⚠ Importe primero la imagen del plano (Imagen de fondo → Importar…).",
+            "⚠ Importez d'abord l'image du plan (Image de fond → Importer…).",
+        ],
+        "⚠ Nenhuma parede encontrada. Confira a escala ou tente o outro modo de conversão." => [
+            "⚠ No walls found. Check the scale or try the other conversion mode.",
+            "⚠ No se encontró ninguna pared. Revise la escala o pruebe el otro modo de conversión.",
+            "⚠ Aucun mur trouvé. Vérifiez l'échelle ou essayez l'autre mode de conversion.",
+        ],
+        "{} paredes criadas a partir da planta. Veja a vista 3D; Ctrl+Z desfaz." => [
+            "{} walls created from the plan. See the 3D view; Ctrl+Z undoes it.",
+            "{} paredes creadas a partir del plano. Mire la vista 3D; Ctrl+Z deshace.",
+            "{} murs créés à partir du plan. Voyez la vue 3D ; Ctrl+Z annule.",
+        ],
+        "Converter planta em 3D" => [
+            "Convert plan to 3D",
+            "Convertir plano en 3D",
+            "Convertir le plan en 3D",
+        ],
+        "Planta impressa ou exportada, com paredes preenchidas. Calibre a escala antes." => [
+            "A printed or exported plan with filled walls. Calibrate the scale first.",
+            "Plano impreso o exportado, con paredes rellenas. Calibre la escala antes.",
+            "Plan imprimé ou exporté, aux murs pleins. Calibrez d'abord l'échelle.",
+        ],
+        "Converter croqui em 3D" => [
+            "Convert sketch to 3D",
+            "Convertir croquis en 3D",
+            "Convertir le croquis en 3D",
+        ],
+        "Desenho à mão (croqui) com linhas finas. Calibre a escala antes." => [
+            "A hand drawing (sketch) with thin lines. Calibrate the scale first.",
+            "Dibujo a mano (croquis) con líneas finas. Calibre la escala antes.",
+            "Dessin à main levée (croquis) aux traits fins. Calibrez d'abord l'échelle.",
+        ],
         _ => return None,
     })
 }
@@ -2303,6 +2395,7 @@ mod tests {
             (Lang::En, "Save"),
             (Lang::Es, "Guardar"),
             (Lang::Fr, "Enregistrer"),
+            (Lang::Ar, "حفظ"),
         ] {
             assert_eq!(say("Salvar", lang), saved);
             // A text nobody translated stays as written, in any language.
@@ -2366,9 +2459,21 @@ mod tests {
     }
 
     #[test]
-    fn only_english_writes_decimals_with_a_dot() {
+    fn only_english_and_arabic_write_decimals_with_a_dot() {
         for lang in Lang::ALL {
-            assert_eq!(lang.decimal_comma(), lang != Lang::En);
+            assert_eq!(lang.decimal_comma(), !matches!(lang, Lang::En | Lang::Ar));
         }
+    }
+
+    #[test]
+    fn arabic_reads_its_own_table_and_falls_back_on_english() {
+        assert_eq!(say("Salvar", Lang::Ar), "حفظ");
+        assert_eq!(fill_in("Versão {}", Lang::Ar, &[&3]), "الإصدار 3");
+        assert_eq!(Lang::from_locale("ar_SA.UTF-8"), Some(Lang::Ar));
+        // Shown for the shaper: the digits come out the right way round.
+        assert_eq!(
+            displayed(&fill_in("Versão {}", Lang::Ar, &[&12]), Lang::Ar),
+            "الإصدار 21"
+        );
     }
 }

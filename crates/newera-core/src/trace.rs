@@ -4,13 +4,18 @@
 //! furniture, dimensions) are left out by the thickness range.
 
 // Image coordinates are far below 2^52.
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+// Pixel coordinates are checked non-negative before they are cast.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
 use image::{GrayImage, Luma, RgbImage};
 
 /// A wall found in the image, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Traced {
+pub struct Traced {
     pub a: [f64; 2],
     pub b: [f64; 2],
     /// Band thickness, px.
@@ -19,7 +24,7 @@ pub(crate) struct Traced {
 
 /// Tuning, in pixels.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TraceOptions {
+pub struct TraceOptions {
     /// Luminance below this is ink.
     pub threshold: u8,
     pub min_length: f64,
@@ -27,11 +32,16 @@ pub(crate) struct TraceOptions {
     pub max_thickness: f64,
     /// Collinear pieces this close (door and window gaps) become one wall.
     pub max_gap: f64,
+    /// A band takes the longest run along it, not the run it started on:
+    /// the edges of a thickened pen line are ragged, so the first line of
+    /// the band is only a piece of the wall. Off for printed plans, whose
+    /// filled walls start with a clean edge.
+    pub grow: bool,
 }
 
 /// Ink of a colored plan: dark and gray, not saturated. Humanized plans paint
 /// lawns, plants, furniture and cars in color; walls are black or gray.
-pub(crate) fn ink_mask(image: &RgbImage, threshold: u8) -> GrayImage {
+pub fn ink_mask(image: &RgbImage, threshold: u8) -> GrayImage {
     GrayImage::from_fn(image.width(), image.height(), |x, y| {
         let [r, g, b] = image.get_pixel(x, y).0;
         let (max, min) = (r.max(g).max(b), r.min(g).min(b));
@@ -103,9 +113,19 @@ fn bands(
                 }
             });
             match hit {
-                Some((k, _)) => {
+                Some((k, &(s, e))) => {
                     used[k] = true;
-                    next.push(Band { last: line, ..band });
+                    let (start, end) = if options.grow {
+                        (band.start.min(s), band.end.max(e))
+                    } else {
+                        (band.start, band.end)
+                    };
+                    next.push(Band {
+                        start,
+                        end,
+                        last: line,
+                        ..band
+                    });
                 }
                 None => done.push(band),
             }
@@ -143,7 +163,7 @@ fn root(group: &mut [usize], i: usize) -> usize {
 /// Horizontal and vertical walls, ends snapped onto the axis of the walls
 /// they run into.
 #[allow(clippy::cast_precision_loss)]
-pub(crate) fn trace(image: &GrayImage, options: &TraceOptions) -> Vec<Traced> {
+pub fn trace(image: &GrayImage, options: &TraceOptions) -> Vec<Traced> {
     let (w, h) = (image.width() as usize, image.height() as usize);
     let dark = |x: usize, y: usize| image.get_pixel(x as u32, y as u32).0[0] < options.threshold;
     let across = bands(&|row, col| dark(col, row), h, w, options);
@@ -298,6 +318,139 @@ pub(crate) fn trace(image: &GrayImage, options: &TraceOptions) -> Vec<Traced> {
         .collect()
 }
 
+/// How a plan image becomes walls: what the window's one-click "plan to
+/// walls" and the `edit_background` tool both ask for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanTrace {
+    /// Luminance 0..255 below which a gray pixel is ink.
+    pub threshold: u8,
+    /// A hand-drawn sketch (كروكي): thin pen or pencil lines that wobble.
+    /// The lines are thickened before tracing, and every wall gets
+    /// [`PlanTrace::sketch_thickness`] since a pen line has no wall width.
+    pub sketch: bool,
+    /// Shortest wall kept, cm.
+    pub min_len: f64,
+    /// Thinnest and thickest wall kept, cm (ignored for sketches).
+    pub t_min: f64,
+    pub t_max: f64,
+    /// Doors and windows up to this wide don't split a wall, cm.
+    pub max_gap: f64,
+    /// Wall thickness for sketches, cm.
+    pub sketch_thickness: f64,
+}
+
+impl Default for PlanTrace {
+    fn default() -> Self {
+        Self {
+            threshold: 128,
+            sketch: false,
+            min_len: 60.0,
+            t_min: 5.0,
+            t_max: 45.0,
+            max_gap: 130.0,
+            sketch_thickness: 15.0,
+        }
+    }
+}
+
+impl PlanTrace {
+    /// The settings for a hand-drawn sketch: pencil is lighter than ink.
+    #[must_use]
+    pub fn sketch() -> Self {
+        Self {
+            threshold: 170,
+            sketch: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// A wall traced from the plan image, in plan cm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanWall {
+    pub start: crate::Point2,
+    pub end: crate::Point2,
+    pub thickness: f64,
+}
+
+/// Every ink pixel grown into a square of `radius` px: a thin, wobbly pen
+/// line becomes a solid band the tracer can follow.
+fn thicken(mask: &GrayImage, radius: u32) -> GrayImage {
+    if radius == 0 {
+        return mask.clone();
+    }
+    let (w, h) = mask.dimensions();
+    let r = i64::from(radius);
+    // Separable: grow along rows, then along columns.
+    let grow = |src: &GrayImage, horizontal: bool| {
+        GrayImage::from_fn(w, h, |x, y| {
+            let (x, y) = (i64::from(x), i64::from(y));
+            let ink = (-r..=r).any(|d| {
+                let (px, py) = if horizontal { (x + d, y) } else { (x, y + d) };
+                px >= 0
+                    && py >= 0
+                    && px < i64::from(w)
+                    && py < i64::from(h)
+                    && src.get_pixel(px as u32, py as u32).0[0] == 0
+            });
+            Luma([if ink { 0 } else { 255 }])
+        })
+    };
+    grow(&grow(mask, true), false)
+}
+
+/// The walls in a plan image laid under the drawing as `bg`, in plan cm.
+///
+/// # Errors
+/// When the image can't be read.
+pub fn plan_walls(
+    bg: &crate::BackgroundImage,
+    image_bytes: &[u8],
+    settings: &PlanTrace,
+) -> Result<Vec<PlanWall>, String> {
+    let image = crate::images::decode(image_bytes)
+        .map_err(|e| format!("cannot read {}: {e}", bg.path))?
+        .to_rgb8();
+    // Colored areas (lawn, plants, furniture, cars) are never ink.
+    let mut mask = ink_mask(&image, settings.threshold);
+    let (sx, sy) = bg.scale();
+    let px = |cm: f64| cm / sx.min(sy);
+    let mut options = TraceOptions {
+        threshold: settings.threshold,
+        min_length: px(settings.min_len),
+        min_thickness: settings.t_min / sx.max(sy),
+        max_thickness: settings.t_max / sx.min(sy),
+        max_gap: px(settings.max_gap),
+        grow: false,
+    };
+    if settings.sketch {
+        // About 1% of the longer side: enough to bridge a pencil's wobble,
+        // little enough that two walls a room apart stay two.
+        let radius = (mask.width().max(mask.height()) / 100).clamp(2, 12);
+        mask = thicken(&mask, radius);
+        // Any band from a pen line up to a thick marker stroke is a wall.
+        options.min_thickness = f64::from(radius);
+        options.max_thickness = f64::from(radius) * 2.0 + 30.0;
+        options.grow = true;
+    }
+    Ok(trace(&mask, &options)
+        .into_iter()
+        .map(|t| {
+            let horizontal = (t.a[1] - t.b[1]).abs() < (t.a[0] - t.b[0]).abs();
+            let thickness = if settings.sketch {
+                settings.sketch_thickness
+            } else {
+                t.thickness * if horizontal { sy } else { sx }
+            };
+            PlanWall {
+                start: bg.plan_point(crate::Point2::new(t.a[0], t.a[1])),
+                end: bg.plan_point(crate::Point2::new(t.b[0], t.b[1])),
+                thickness: (thickness * 10.0).round() / 10.0,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use image::Luma;
@@ -338,6 +491,7 @@ mod tests {
                 min_thickness: 5.0,
                 max_thickness: 30.0,
                 max_gap: 80.0,
+                grow: false,
             },
         );
         assert_eq!(walls.len(), 1, "{walls:?}");
@@ -366,6 +520,7 @@ mod tests {
                 min_thickness: 5.0,
                 max_thickness: 30.0,
                 max_gap: 0.0,
+                grow: false,
             },
         );
         assert_eq!(walls.len(), 5, "{walls:?}");
@@ -385,5 +540,74 @@ mod tests {
             (partition.a[1] - 16.0).abs() < 0.5 && (partition.b[1] - 304.0).abs() < 0.5,
             "{partition:?}"
         );
+    }
+
+    /// A hand-drawn sketch: a 2 px pencil rectangle that wobbles, with a
+    /// line across the middle for an inner wall. Read as a printed plan the
+    /// lines are too thin to be walls; read as a sketch they are five walls.
+    fn sketch_png() -> (crate::BackgroundImage, Vec<u8>) {
+        let (w, h) = (600u32, 400u32);
+        let mut image = RgbImage::from_pixel(w, h, image::Rgb([250, 250, 245]));
+        let mut dot = |x: i64, y: i64| {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (px, py) = (x + dx, y + dy);
+                    if px >= 0 && py >= 0 && px < i64::from(w) && py < i64::from(h) {
+                        image.put_pixel(px as u32, py as u32, image::Rgb([90, 90, 100]));
+                    }
+                }
+            }
+        };
+        // Wobble of ±2 px, as a hand would draw it.
+        let wobble = |t: i64| ((t / 7) % 5) - 2;
+        for x in 50..550 {
+            dot(x, 50 + wobble(x));
+            dot(x, 350 + wobble(x + 3));
+        }
+        for y in 50..350 {
+            dot(50 + wobble(y), y);
+            dot(550 + wobble(y + 5), y);
+            dot(300 + wobble(y + 2), y);
+        }
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let bg = crate::BackgroundImage {
+            path: "sketch.png".into(),
+            size_px: [w, h],
+            // 2 cm per px: the house is 10 m by 6 m.
+            cm_per_px: 2.0,
+            ..crate::BackgroundImage::default()
+        };
+        (bg, bytes)
+    }
+
+    #[test]
+    fn a_hand_drawn_sketch_becomes_walls() {
+        let (bg, bytes) = sketch_png();
+        let printed = plan_walls(&bg, &bytes, &PlanTrace::default()).unwrap();
+        assert!(
+            printed.is_empty(),
+            "pencil lines are not printed walls: {printed:?}"
+        );
+        let walls = plan_walls(&bg, &bytes, &PlanTrace::sketch()).unwrap();
+        assert_eq!(walls.len(), 5, "{walls:#?}");
+        assert!(walls.iter().all(|w| (w.thickness - 15.0).abs() < 1e-9));
+        // The long walls run the full 10 m (500 px), give or take the pen.
+        let long = walls
+            .iter()
+            .filter(|w| (w.start.x - w.end.x).abs() > 900.0)
+            .count();
+        assert_eq!(long, 2, "{walls:#?}");
+    }
+
+    #[test]
+    fn an_unreadable_image_is_an_error() {
+        let bg = crate::BackgroundImage::default();
+        assert!(plan_walls(&bg, b"not an image", &PlanTrace::default()).is_err());
     }
 }

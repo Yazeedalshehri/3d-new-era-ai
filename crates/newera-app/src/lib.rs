@@ -11,6 +11,7 @@ mod cabinets;
 mod dialogs;
 mod ergonomics;
 mod files;
+mod fonts;
 #[cfg(not(target_arch = "wasm32"))]
 mod gpu;
 mod i18n;

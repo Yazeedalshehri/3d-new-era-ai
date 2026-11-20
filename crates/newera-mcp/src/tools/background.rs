@@ -139,43 +139,34 @@ impl NewEraMcp {
         let mut doc = self.document.write();
         let bg = background_scale(&doc)?.image;
         let path = newera_core::resolve_asset(doc.asset_dir().as_deref(), &bg.path);
-        let image = image::open(&path)
-            .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?
-            .to_rgb8();
-        // Colored areas (lawn, plants, furniture, cars) are never ink.
-        let image = crate::trace::ink_mask(&image, p.threshold.unwrap_or(128));
-        let (sx, sy) = bg.scale();
-        let px = |cm: f64| cm / sx.min(sy);
-        let options = crate::trace::TraceOptions {
-            threshold: p.threshold.unwrap_or(128),
-            min_length: px(p.min_len.unwrap_or(60.0)),
-            min_thickness: p.t_min.unwrap_or(5.0) / sx.max(sy),
-            max_thickness: p.t_max.unwrap_or(45.0) / sx.min(sy),
-            max_gap: px(p.max_gap.unwrap_or(130.0)),
+        let bytes = newera_core::vfs::read(&path)
+            .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
+        let base = newera_core::trace::PlanTrace::default();
+        let settings = newera_core::trace::PlanTrace {
+            threshold: p.threshold.unwrap_or(base.threshold),
+            min_len: p.min_len.unwrap_or(base.min_len),
+            t_min: p.t_min.unwrap_or(base.t_min),
+            t_max: p.t_max.unwrap_or(base.t_max),
+            max_gap: p.max_gap.unwrap_or(base.max_gap),
+            ..base
         };
-        let walls: Vec<(Point2, Point2, f64)> = crate::trace::trace(&image, &options)
-            .into_iter()
-            .map(|t| {
-                let horizontal = (t.a[1] - t.b[1]).abs() < (t.a[0] - t.b[0]).abs();
-                let thickness = t.thickness * if horizontal { sy } else { sx };
-                (
-                    bg.plan_point(Point2::new(t.a[0], t.a[1])),
-                    bg.plan_point(Point2::new(t.b[0], t.b[1])),
-                    (thickness * 10.0).round() / 10.0,
-                )
-            })
-            .filter(|(a, b, _)| {
-                p.region.is_none_or(|[x0, y0, x1, y1]| {
-                    let inside = |q: &Point2| {
-                        q.x >= x0.min(x1)
-                            && q.x <= x0.max(x1)
-                            && q.y >= y0.min(y1)
-                            && q.y <= y0.max(y1)
-                    };
-                    inside(a) && inside(b)
+        let walls: Vec<(Point2, Point2, f64)> =
+            newera_core::trace::plan_walls(&bg, &bytes, &settings)
+                .map_err(invalid)?
+                .into_iter()
+                .map(|w| (w.start, w.end, w.thickness))
+                .filter(|(a, b, _)| {
+                    p.region.is_none_or(|[x0, y0, x1, y1]| {
+                        let inside = |q: &Point2| {
+                            q.x >= x0.min(x1)
+                                && q.x <= x0.max(x1)
+                                && q.y >= y0.min(y1)
+                                && q.y <= y0.max(y1)
+                        };
+                        inside(a) && inside(b)
+                    })
                 })
-            })
-            .collect();
+                .collect();
         if p.create {
             if walls.is_empty() {
                 return Err(invalid(
