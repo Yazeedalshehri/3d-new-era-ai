@@ -494,3 +494,36 @@ fn progress_window() {
     });
     hold.store(false, Ordering::Relaxed);
 }
+
+/// A hand sketch (كروكي) under the plan, turned into walls in one click, with
+/// the window in Arabic: `NEWERA_SKETCH` names the image, 1 cm per pixel.
+#[test]
+#[ignore = "visual review; needs a GPU"]
+fn arabic_sketch_to_3d() {
+    let Ok(path) = std::env::var("NEWERA_SKETCH") else {
+        return;
+    };
+    let (w, h) = image::image_dimensions(&path).unwrap();
+    let mut doc = Document::default();
+    doc.execute(Command::SetBackground {
+        background: Some(newera_core::BackgroundImage {
+            path: path.clone(),
+            size_px: [w, h],
+            cm_per_px: 1.0,
+            opacity: 0.5,
+            visible: true,
+            ..Default::default()
+        }),
+    })
+    .unwrap();
+    let shared = SharedDocument::new(doc);
+    crate::i18n::set(crate::i18n::Lang::Ar);
+    render("arabic-sketch-before", shared.clone(), |_| {
+        crate::i18n::set(crate::i18n::Lang::Ar);
+    });
+    render("arabic-sketch-to-3d", shared, |app| {
+        crate::i18n::set(crate::i18n::Lang::Ar);
+        app.walls_from_background(true, None);
+    });
+    crate::i18n::set(crate::i18n::Lang::Pt);
+}

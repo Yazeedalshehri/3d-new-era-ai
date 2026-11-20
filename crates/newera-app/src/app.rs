@@ -226,9 +226,6 @@ impl NewEraApp {
         document: SharedDocument,
         mcp_url: Option<String>,
     ) -> Self {
-        let mut fonts = egui::FontDefinitions::default();
-        crate::icon::add_to_fonts(&mut fonts);
-        cc.egui_ctx.set_fonts(fonts);
         crate::theme::apply(&cc.egui_ctx);
 
         let stored = cc
@@ -252,6 +249,7 @@ impl NewEraApp {
         });
         settings.lang = Some(lang);
         crate::i18n::set(lang);
+        crate::fonts::sync(&cc.egui_ctx);
         crate::theme::set_mode(&cc.egui_ctx, settings.theme);
         let dark = cc.egui_ctx.theme() == egui::Theme::Dark;
         #[cfg(target_arch = "wasm32")]
@@ -1203,6 +1201,70 @@ impl NewEraApp {
         );
     }
 
+    /// Turns the plan image under the drawing into walls, in one undo step:
+    /// the 3D view builds itself from them. `sketch` is for a hand-drawn
+    /// plan (كروكي) with thin pen lines; otherwise the image is a printed or
+    /// exported plan with filled walls.
+    pub(crate) fn walls_from_background(&mut self, sketch: bool, threshold: Option<u8>) {
+        let (bg, bytes) = {
+            let doc = self.document.read();
+            let home = doc.home();
+            let Some(bg) = home
+                .current_level()
+                .and_then(|id| home.level(id))
+                .and_then(|l| l.background.as_ref())
+                .or(home.background.as_ref())
+                .cloned()
+            else {
+                drop(doc);
+                return self.set_status(crate::i18n::tr(
+                    "⚠ Importe primeiro a imagem da planta (Imagem de fundo → Importar…).",
+                ));
+            };
+            let path = newera_core::resolve_asset(doc.asset_dir().as_deref(), &bg.path);
+            match newera_core::vfs::read(&path) {
+                Ok(bytes) => (bg, bytes),
+                Err(err) => {
+                    drop(doc);
+                    return self.set_status(crate::i18n::fill("⚠ Imagem inválida: {}", &[&err]));
+                }
+            }
+        };
+        let mut settings = if sketch {
+            newera_core::trace::PlanTrace::sketch()
+        } else {
+            newera_core::trace::PlanTrace::default()
+        };
+        if let Some(threshold) = threshold {
+            settings.threshold = threshold;
+        }
+        let walls = match newera_core::trace::plan_walls(&bg, &bytes, &settings) {
+            Ok(walls) => walls,
+            Err(err) => return self.set_status(format!("⚠ {err}")),
+        };
+        if walls.is_empty() {
+            return self.set_status(crate::i18n::tr(
+                "⚠ Nenhuma parede encontrada. Confira a escala ou tente o outro modo de conversão.",
+            ));
+        }
+        let count = walls.len();
+        self.run(|doc| {
+            let commands = walls
+                .iter()
+                .map(|w| {
+                    let mut wall = newera_core::Wall::new(doc.new_wall_id(), w.start, w.end);
+                    wall.thickness = w.thickness;
+                    Command::insert(wall)
+                })
+                .collect();
+            doc.execute(Command::Batch { commands })
+        });
+        self.set_status(crate::i18n::fill(
+            "{} paredes criadas a partir da planta. Veja a vista 3D; Ctrl+Z desfaz.",
+            &[&count],
+        ));
+    }
+
     // --- Selection & clipboard -------------------------------------------------
 
     fn selected_elements(&self) -> Vec<Element> {
@@ -1952,7 +2014,40 @@ impl NewEraApp {
                             )
                             .clicked()
                         {
-                            self.dialog = background.map(Dialog::Background);
+                            self.dialog = background.clone().map(Dialog::Background);
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                background.is_some(),
+                                egui::Button::new(format!(
+                                    "{} {}",
+                                    icon::CUBE,
+                                    crate::i18n::tr("Converter planta em 3D")
+                                )),
+                            )
+                            .on_hover_text(crate::i18n::tr(
+                                "Planta impressa ou exportada, com paredes preenchidas. Calibre a escala antes.",
+                            ))
+                            .clicked()
+                        {
+                            self.walls_from_background(false, None);
+                        }
+                        if ui
+                            .add_enabled(
+                                background.is_some(),
+                                egui::Button::new(format!(
+                                    "{} {}",
+                                    icon::PENCIL_SIMPLE,
+                                    crate::i18n::tr("Converter croqui em 3D")
+                                )),
+                            )
+                            .on_hover_text(crate::i18n::tr(
+                                "Desenho à mão (croqui) com linhas finas. Calibre a escala antes.",
+                            ))
+                            .clicked()
+                        {
+                            self.walls_from_background(true, None);
                         }
                     },
                 );
@@ -2874,6 +2969,8 @@ impl NewEraApp {
 impl eframe::App for NewEraApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Arabic puts its font first; any other language keeps it as a fallback.
+        crate::fonts::sync(&ctx);
         // A browser canvas starts at 300×150 until the page lays it out; panel
         // sizes chosen then would stick, so wait for the real size.
         #[cfg(target_arch = "wasm32")]

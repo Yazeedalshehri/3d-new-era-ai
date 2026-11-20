@@ -44,6 +44,7 @@ pub mod standards;
 mod style;
 pub mod tape;
 pub mod text;
+pub mod trace;
 mod units;
 pub mod vfs;
 pub mod vocabulary;
